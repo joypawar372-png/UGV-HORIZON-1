@@ -16,10 +16,37 @@ Featuring a premium, dark flight cockpit interface, it enables long-range survei
 
 ---
 
+
+---
+# 🛰️ UGV HORIZON 1 - COMPLETE DEPLOYMENT PLAYBOOK
+
+This master deployment guide covers setting up your project files on your main computer, pushing them to GitHub, and pulling/running them directly on your Raspberry Pi 4B.
+
+
+## 📁 1. ENVIRONMENT CONFIGURATION FILES
+
+### File: requirements.txt
+# Paste the following block directly into a file named "requirements.txt"
+flask>=3.0.0
+flask-socketio>=5.3.0
+numpy>=1.24.0
+opencv-python-headless>=4.7.0
+smbus2>=0.4.2
+pyserial>=3.5
+
+---
+
+### File: README.md
+# Paste the following block directly into a file named "README.md"
+# 🛰️ UGV HORIZON 1 (Autonomous RC Tank Edition)
+
+🤖 Use Case: Autonomous long-range tactical surveillance rover. 💰 Build Cost: ~$220. ⚙️ Features: DJI-inspired HUD web dashboard, FlySky FS-i6X manual override, 3D-printed gear torque protection, terrain-adaptive IMU throttle, dual-sonar obstacle avoidance, NEO-6M GPS waypoint navigation, and live Pi camera video streaming.
+
+
 ## 🛠️ Master Hardware Pinout Reference
 
 | Component | Function | Raspberry Pi BCM Pin | Physical Pin Header | Hardware Wiring Requirements |
-
+| :--- | :--- | :--- | :--- | :--- |
 | **Left Brushless ESC** | PWM Signal Line | GPIO 17 | **Pin 11** | Connect directly to Bidirectional ESC signal. |
 | **Right Brushless ESC**| PWM Signal Line | GPIO 18 | **Pin 12** | Connect directly to Bidirectional ESC signal. |
 | **Left Echo Sonar** | Trigger Pulse | GPIO 23 | **Pin 16** | Outbound ultrasonic transducer trigger. |
@@ -41,25 +68,8 @@ Featuring a premium, dark flight cockpit interface, it enables long-range survei
 
 ### 1. Initialize Host Dependencies
 Before running the primary platform engine, updates and system-level input tracking daemons must be activated on your Raspberry Pi:
-
 ```bash
 sudo apt-get update
 sudo apt-get install pigpio python3-pigpio rpicam-apps -y
 sudo systemctl enable pigpiod
 sudo systemctl start pigpiod
-
-2. Environment Setup
-Install the required micro-framework libraries via pip:```bash
-pip install flask flask-socketio numpy opencv-python-headless smbus2 pyserial
-
-3. Execution
-Run the core runtime script as a superuser to allow the software to open the hardware DMA memory channels for high-accuracy PWM execution:```bash
-sudo python3 main.py
-
-🕹️ Cockpit System Control Modes
-MANUAL (WEB INTERFACE): System responds directly to the custom, spring-loaded virtual vector pad on your DJI style screen dashboard. Releasing the mouse or touch array instantly snaps throttle targets back to zero safely.
-
-MANUAL_RC (TRANSMITTER OVERRIDE): Actively checks radio frequency pulses. Moving physical switches into this zone hands drive execution directly to your physical joysticks, completely bypassing network input streams.
-
-AUTONOMOUS_PATH (SURVEILLANCE MODE): The rover automatically executes a route following sequential mission target markers (WP 1, WP 2, WP 3) plotted on the satellite HUD while maintaining 360° proactive ultrasonic obstacle scanning loops.
-
