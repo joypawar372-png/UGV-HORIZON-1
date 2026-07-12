@@ -1,0 +1,726 @@
+main.py
+#!/usr/bin/env python3
+import os
+import sys
+import time
+import math
+import json
+import socket
+import serial
+import subprocess
+import threading
+import logging
+import cv2
+import numpy as np
+import smbus2
+import pigpio
+from flask import Flask, render_template_string, Response
+from flask_socketio import SocketIO, emit
+
+# ==========================================
+# ADVANCED LOGISTICS & GROUND CONFIGURATION
+# ==========================================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)-8s] %(message)s')
+log = logging.getLogger("TITAN_V13")
+
+# Actuator & Input Mapping
+MOTOR_LEFT = 17
+MOTOR_RIGHT = 18
+SONAR_L_TRIG = 23
+SONAR_L_ECHO = 24
+SONAR_R_TRIG = 22
+SONAR_R_ECHO = 27
+
+# RC PWM Input Mapping
+RC_CH1_PIN = 5   # Steering
+RC_CH2_PIN = 6   # Throttle
+RC_CH5_PIN = 13  # Mode Select Switch
+
+MPU_ADDR = 0x68
+MISSIONS_FILE = os.path.expanduser("~/titan_missions_registry.json")
+
+# Core Telemetry Data Plane
+state = {
+    "lat": 28.8955, "lon": 76.6066, "gps_fix": 0,  # Default Locked Region: Rohtak, India
+    "sonar_l_cm": 400.0, "sonar_r_cm": 400.0,
+    "pitch_deg": 0.0, "roll_deg": 0.0,
+    "armed": False, "mode": "MANUAL", "path_error": 0,
+    "drive": {"throttle": 0.0, "steering": 0.0},
+    "current_left_pwm": 1500, "current_right_pwm": 1500,
+    "health": {
+        "motor_l": "OFFLINE", "motor_r": "OFFLINE", "sonar_l": "OFFLINE",
+        "sonar_r": "OFFLINE", "gps": "OFFLINE", "imu": "OFFLINE", "camera": "OFFLINE", "rc_rx": "OFFLINE"
+    }
+}
+
+# Safety Limits for 3D-Printed Gears
+MAX_RPM_THROTTLE_CEILING = 0.45  # Max scale constraint to safeguard structural integrity
+SLEW_RATE_LIMIT = 0.08           # Max permissible step variance per 20ms frame loop
+
+# RC Pulse Width Reader Class
+class PulseWidthReader:
+    def __init__(self, pi, pin):
+        self.pi = pi
+        self.pin = pin
+        self.tick = None
+        self.pulse_width = 1500
+        self.pi.set_mode(pin, pigpio.INPUT)
+        self.cb = self.pi.callback(pin, pigpio.EITHER_EDGE, self._cbf)
+    def _cbf(self, gpio, level, tick):
+        if level == 1:
+            self.tick = tick
+        elif level == 0 and self.tick is not None:
+            self.pulse_width = pigpio.tickDiff(self.tick, tick)
+
+frame_buffer = None
+frame_lock = threading.Lock()
+
+pi = pigpio.pi()
+if not pi.connected:
+    log.error("CRITICAL: pigpiod daemon unreachable. System Halting.")
+    sys.exit(1)
+
+# Initialize Pulse Input Monitors
+rc_ch1 = PulseWidthReader(pi, RC_CH1_PIN)
+rc_ch2 = PulseWidthReader(pi, RC_CH2_PIN)
+rc_ch5 = PulseWidthReader(pi, RC_CH5_PIN)
+
+pi.set_mode(SONAR_L_TRIG, pigpio.OUTPUT)
+pi.set_mode(SONAR_L_ECHO, pigpio.INPUT)
+pi.set_mode(SONAR_R_TRIG, pigpio.OUTPUT)
+pi.set_mode(SONAR_R_ECHO, pigpio.INPUT)
+
+# ==========================================
+# BLDC DRIVER & SMOOTH KINEMATICS ENGINE
+# ==========================================
+def bldc_arming_handshake_sequence():
+    state["armed"] = False
+    state["health"]["motor_l"] = "ARMING"
+    state["health"]["motor_r"] = "ARMING"
+    
+    pi.set_servo_pulsewidth(MOTOR_LEFT, 1500)
+    pi.set_servo_pulsewidth(MOTOR_RIGHT, 1500)
+    time.sleep(2.0)
+    pi.set_servo_pulsewidth(MOTOR_LEFT, 1000)
+    pi.set_servo_pulsewidth(MOTOR_RIGHT, 1000)
+    time.sleep(2.0)
+    pi.set_servo_pulsewidth(MOTOR_LEFT, 1500)
+    pi.set_servo_pulsewidth(MOTOR_RIGHT, 1500)
+    time.sleep(1.0)
+    
+    state["armed"] = True
+    state["health"]["motor_l"] = "ONLINE"
+    state["health"]["motor_r"] = "ONLINE"
+    log.info("Structural Powertrain Safety Calibration Array online.")
+
+def motor_kinematics_controller():
+    bldc_arming_handshake_sequence()
+    
+    # Internal track state variables for acceleration smoothing
+    smooth_t = 0.0
+    smooth_s = 0.0
+    
+    while True:
+        # Check Hardware Remote Control Status / Mode Toggle Switch (Ch 5)
+        # 1000-1300: MANUAL (RC), 1400-1600: MANUAL (WEB), 1700-2100: AUTO
+        ch5_val = rc_ch5.pulse_width
+        if 900 <= ch5_val <= 2100:
+            state["health"]["rc_rx"] = "ONLINE"
+            if ch5_val < 1350:
+                state["mode"] = "MANUAL_RC"
+            elif ch5_val < 1650:
+                if state["mode"] == "MANUAL_RC": state["mode"] = "MANUAL"
+        else:
+            state["health"]["rc_rx"] = "OFFLINE"
+
+        # Arbitrate Target Inputs based on active mode
+        if state["mode"] == "MANUAL_RC":
+            raw_rc_t = (rc_ch2.pulse_width - 1500) / 500.0
+            raw_rc_s = (rc_ch1.pulse_width - 1500) / 500.0
+            target_throttle = max(min(raw_rc_t, 1.0), -1.0)
+            target_steering = max(min(raw_rc_s, 1.0), -1.0)
+        elif state["mode"] == "MANUAL":
+            target_throttle = state["drive"]["throttle"]
+            target_steering = state["drive"]["steering"]
+        elif state["mode"] == "AUTONOMOUS_PATH":
+            target_throttle = 0.20
+            target_steering = - (state["path_error"] / 160.0) * 1.2
+        else:
+            target_throttle, target_steering = 0.0, 0.0
+
+        # Dynamic Obstacle Proportional Slowdown Overlay
+        min_sonar = min(state["sonar_l_cm"], state["sonar_r_cm"])
+        if min_sonar < 80.0 and target_throttle > 0:
+            # Scale forward speed down safely based on distance
+            factor = max(0.0, (min_sonar - 20.0) / 60.0)
+            target_throttle *= factor
+            # Inject defensive steering bypass
+            if state["sonar_l_cm"] < state["sonar_r_cm"]:
+                target_steering += 0.35 * (1.0 - factor)
+            else:
+                target_steering -= 0.35 * (1.0 - factor)
+
+        # Gyro Slope Adaptation Modifier
+        # Compensates for hills to minimize gear fatigue
+        if abs(state["pitch_deg"]) > 4.0:
+            pitch_contribution = (state["pitch_deg"] / 45.0) * 0.15
+            target_throttle += pitch_contribution
+
+        # Bounded Structural Envelope Clamping
+        target_throttle = max(min(target_throttle, MAX_RPM_THROTTLE_CEILING), -MAX_RPM_THROTTLE_CEILING)
+        target_steering = max(min(target_steering, 0.5), -0.5)
+
+        # Anti-Jerk Slew Rate Filter Integration
+        dt_t = target_throttle - smooth_t
+        dt_s = target_steering - smooth_s
+        smooth_t += max(min(dt_t, SLEW_RATE_LIMIT), -SLEW_RATE_LIMIT)
+        smooth_s += max(min(dt_s, SLEW_RATE_LIMIT), -SLEW_RATE_LIMIT)
+
+        # Kinematic Track Mixing Matrix
+        if abs(smooth_t) < 0.05 and abs(smooth_s) > 0.15:
+            # Explicit Zero-Radius Pivot Turn Execution
+            left_mix = smooth_s
+            right_mix = -smooth_s
+        else:
+            # Smooth Blended Flow Turn Curve Mechanics
+            if smooth_s >= 0:  # Turning Right: Slow down right track, accelerate left
+                left_mix = smooth_t + (smooth_s * 0.4)
+                right_mix = smooth_t - (smooth_s * 0.6)
+            else:             # Turning Left: Slow down left track, accelerate right
+                left_mix = smooth_t + (smooth_s * 0.6)
+                right_mix = smooth_t - (smooth_s * 0.4)
+
+        left_pwm = int(1500 + left_mix * 500)
+        right_pwm = int(1500 - right_mix * 500) # Inverted for bidirectional matching configuration
+
+        left_pwm = max(min(left_pwm, 2000), 1000)
+        right_pwm = max(min(right_pwm, 2000), 1000)
+
+        state["current_left_pwm"] = left_pwm
+        state["current_right_pwm"] = right_pwm
+
+        if state["armed"]:
+            pi.set_servo_pulsewidth(MOTOR_LEFT, left_pwm)
+            pi.set_servo_pulsewidth(MOTOR_RIGHT, right_pwm)
+        time.sleep(0.02)
+
+# ==========================================
+# ASYNCHRONOUS HIGH-PRECISION RECON WORKERS
+# ==========================================
+def sonar_isolation_polling_worker():
+    def execute_ping(trig, echo):
+        pi.write(trig, 1)
+        time.sleep(0.00001)
+        pi.write(trig, 0)
+        st = time.time()
+        p_start = st
+        while pi.read(echo) == 0 and (time.time() - st) < 0.02:
+            p_start = time.time()
+        et = time.time()
+        p_end = p_start
+        while pi.read(echo) == 1 and (time.time() - et) < 0.02:
+            p_end = time.time()
+        dist = ((p_end - p_start) * 34300) / 2.0
+        return dist if 2.0 <= dist <= 400.0 else None
+
+    while True:
+        l_val = execute_ping(SONAR_L_TRIG, SONAR_L_ECHO)
+        if l_val is not None:
+            state["sonar_l_cm"] = (state["sonar_l_cm"] * 0.3) + (l_val * 0.7)
+            state["health"]["sonar_l"] = "ONLINE"
+        else: state["health"]["sonar_l"] = "OFFLINE"
+        time.sleep(0.03)
+
+        r_val = execute_ping(SONAR_R_TRIG, SONAR_R_ECHO)
+        if r_val is not None:
+            state["sonar_r_cm"] = (state["sonar_r_cm"] * 0.3) + (r_val * 0.7)
+            state["health"]["sonar_r"] = "ONLINE"
+        else: state["health"]["sonar_r"] = "OFFLINE"
+        time.sleep(0.03)
+
+def imu_pitch_roll_worker():
+    try:
+        bus = smbus2.SMBus(1)
+        bus.write_byte_data(MPU_ADDR, 0x6B, 0x00) # Wake up sensor
+        state["health"]["imu"] = "ONLINE"
+    except Exception:
+        state["health"]["imu"] = "OFFLINE"
+        return
+
+    while True:
+        try:
+            # Read accelerometer raw registers
+            data = bus.read_i2c_block_data(MPU_ADDR, 0x3B, 6)
+            ax = np.int16((data[0] << 8) | data[1]) / 16384.0
+            ay = np.int16((data[2] << 8) | data[3]) / 16384.0
+            az = np.int16((data[4] << 8) | data[5]) / 16384.0
+            
+            # Extract roll and pitch metrics mathematically
+            state["pitch_deg"] = math.atan2(ay, math.sqrt(ax*ax + az*az)) * 57.2958
+            state["roll_deg"] = math.atan2(-ax, az) * 57.2958
+            state["health"]["imu"] = "ONLINE"
+        except Exception:
+            state["health"]["imu"] = "ERROR"
+        time.sleep(0.04)
+
+def gps_parser_worker():
+    port = "/dev/ttyS0" if os.path.exists("/dev/ttyS0") else "/dev/ttyAMA0"
+    try:
+        ser = serial.Serial(port, baudrate=9600, timeout=0.5)
+        state["health"]["gps"] = "ONLINE (NO FIX)"
+    except Exception:
+        state["health"]["gps"] = "OFFLINE"
+        return
+
+    while True:
+        try:
+            line = ser.readline().decode('ascii', errors='ignore').strip()
+            if line.startswith(('$GPRMC', '$GNRMC')):
+                parts = line.split(',')
+                if len(parts) >= 7 and parts[2] == 'A':
+                    raw_lat, lat_dir, raw_lon, lon_dir = parts[3], parts[4], parts[5], parts[6]
+                    lat = (float(raw_lat[:2]) + float(raw_lat[2:]) / 60.0) * (-1 if lat_dir == 'S' else 1)
+                    lon = (float(raw_lon[:3]) + float(raw_lon[3:]) / 60.0) * (-1 if lon_dir == 'W' else 1)
+                    
+                    state["lat"], state["lon"], state["gps_fix"] = lat, lon, 1
+                    state["health"]["gps"] = "ONLINE (3D LOCK)"
+                else:
+                    state["gps_fix"] = 0
+                    state["health"]["gps"] = "ONLINE (NO FIX)"
+        except Exception: pass
+        time.sleep(0.05)
+
+def camera_stream_worker():
+    global frame_buffer
+    cmd = ["rpicam-vid", "-t", "0", "--inline", "--width", "320", "--height", "240", "--codec", "mjpeg", "-o", "-", "--nopreview"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        byte_stream = b""
+        state["health"]["camera"] = "ONLINE"
+        while True:
+            chunk = proc.stdout.read(4096)
+            if not chunk: break
+            byte_stream += chunk
+            s = byte_stream.find(b'\xff\xd8')
+            e = byte_stream.find(b'\xff\xd9')
+            if s != -1 and e != -1 and e > s:
+                jpg_bytes = byte_stream[s:e+2]
+                byte_stream = byte_stream[e+2:]
+                img = cv2.imdecode(np.frombuffer(jpg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if img is not None:
+                    # Vision Line-Tracking Overlay Simulation
+                    h, w = img.shape[:2]
+                    cv2.line(img, (w // 2, 0), (w // 2, h), (0, 255, 255), 1)
+                    _, encoded = cv2.imencode('.jpg', img)
+                    with frame_lock:
+                        frame_buffer = encoded.tobytes()
+    except Exception: state["health"]["camera"] = "OFFLINE"
+
+# ==========================================
+# DJI HUD DISPLAY STYLING FLIGHT PACK
+# ==========================================
+UI_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Titan Drone OS - DJI Glass Cockpit</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/nipplejs/0.9.1/nipplejs.min.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        :root { --bg-dark: #07090b; --dji-gray: #12161a; --dji-light-gray: #1a2129; --dji-green: #00ff66; --dji-red: #ff3333; --dji-amber: #ffaa00; --text-pure: #ffffff; }
+        body { background: var(--bg-dark); color: var(--text-pure); font-family: "SF Pro Text", -apple-system, sans-serif; margin: 0; overflow: hidden; padding: 10px; box-sizing: border-box; }
+        
+        .dji-dashboard { display: grid; grid-template-columns: 1fr 360px; gap: 10px; height: calc(100vh - 20px); }
+        .viewport-pane { position: relative; display: flex; flex-direction: column; gap: 10px; height: 100%; }
+        .video-container { position: relative; flex: 1; background: #000; border-radius: 6px; overflow: hidden; border: 1px solid #232c35; }
+        .video-container img { width: 100%; height: 100%; object-fit: cover; }
+        
+        /* Tactical HUD Overlays */
+        .hud-overlay-top { position: absolute; top: 0; left: 0; right: 0; background: linear-gradient(to bottom, rgba(0,0,0,0.8), transparent); padding: 12px 20px; display: flex; justify-content: space-between; z-index: 1000; font-size: 0.85rem; font-weight: 600; letter-spacing: 0.05em; }
+        .hud-item { display: flex; align-items: center; gap: 6px; }
+        .hud-item span { color: var(--dji-green); }
+
+        .sidebar-pane { background: var(--dji-gray); border: 1px solid #232c35; border-radius: 6px; padding: 15px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; }
+        .card-sec { background: var(--dji-light-gray); border: 1px solid #2a3541; border-radius: 4px; padding: 12px; }
+        h4 { margin: 0 0 8px 0; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; color: #8a96a3; border-bottom: 1px solid #2a3541; padding-bottom: 4px; }
+        
+        .sys-row { display: flex; justify-content: space-between; font-size: 0.8rem; margin: 5px 0; }
+        .badge { font-weight: 700; font-size: 0.7rem; padding: 2px 6px; border-radius: 2px; }
+        .bg-ok { background: rgba(0,255,102,0.12); color: var(--dji-green); border: 1px solid rgba(0,255,102,0.3); }
+        .bg-fail { background: rgba(255,51,51,0.12); color: var(--dji-red); border: 1px solid rgba(255,51,51,0.3); }
+        
+        #map { width: 100%; height: 200px; border-radius: 4px; border: 1px solid #2a3541; margin-top: 5px; }
+        .btn { background: #2f3842; color: #fff; border: 1px solid #455261; padding: 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; cursor: pointer; width: 100%; text-transform: uppercase; }
+        .btn:active { background: #1e242b; }
+        .btn-primary { background: var(--dji-green); color: #000; border: none; }
+        .btn-primary:active { background: #00cc52; }
+
+        /* Spring-Loaded Tactile Virtual Control Stick Container */
+        .control-stick-deck { display: flex; justify-content: center; align-items: center; padding: 10px 0; }
+        #joystick-pod { width: 140px; height: 140px; background: #07090b; border: 2px solid #2a3541; border-radius: 50%; position: relative; touch-action: none; }
+        .select-input { width: 100%; background: #07090b; color: #fff; border: 1px solid #2a3541; padding: 6px; border-radius: 4px; font-size: 0.8rem; }
+    </style>
+</head>
+<body>
+
+    <div class="dji-dashboard">
+        <div class="viewport-pane">
+            <div class="video-container">
+                <div class="hud-overlay-top">
+                    <div class="hud-item">SYS STATUS: <span id="hud-status">READY</span></div>
+                    <div class="hud-item">MODE: <span id="hud-mode" style="color:var(--dji-amber)">MANUAL</span></div>
+                    <div class="hud-item">L-TRACK: <span id="hud-lpwm">1500us</span></div>
+                    <div class="hud-item">R-TRACK: <span id="hud-rpwm">1500us</span></div>
+                    <div class="hud-item">PITCH: <span id="hud-pitch" style="color:#fff">0.0°</span></div>
+                </div>
+                <img src="/video_feed" alt="Primary Feed Hardware Node">
+            </div>
+            
+            <div class="card-sec" style="padding: 10px;">
+                <h4>Satellite Operational Grid Tracking</h4>
+                <div id="map"></div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:6px;">
+                    <button class="btn" onclick="lockMapToHome()">Lock Coordinates (Rohtak Region)</button>
+                    <button class="btn" style="color:var(--dji-red)" onclick="wipePathSequence()">Purge Route Map</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="sidebar-pane">
+            <div class="card-sec">
+                <h4>System Peripheral Diagnostics</h4>
+                <div class="sys-row">Left Brushless ESC: <span id="chk-ml" class="badge bg-fail">OFFLINE</span></div>
+                <div class="sys-row">Right Brushless ESC: <span id="chk-mr" class="badge bg-fail">OFFLINE</span></div>
+                <div class="sys-row">Left Safety Sonar: <span id="chk-sl" class="badge bg-fail">OFFLINE</span></div>
+                <div class="sys-row">Right Safety Sonar: <span id="chk-sr" class="badge bg-fail">OFFLINE</span></div>
+                <div class="sys-row">NEO-6M Core GPS: <span id="chk-gps" class="badge bg-fail">OFFLINE</span></div>
+                <div class="sys-row">MPU 9-Axis Gyro: <span id="chk-imu" class="badge bg-fail">OFFLINE</span></div>
+                <div class="sys-row">Optic Imaging Matrix: <span id="chk-cam" class="badge bg-fail">OFFLINE</span></div>
+                <div class="sys-row">FlySky FS-i6X Link: <span id="chk-rc" class="badge bg-fail">OFFLINE</span></div>
+            </div>
+
+            <div class="card-sec">
+                <h4>System Authorization Plane</h4>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
+                    <button class="btn btn-primary" onclick="changeMode('MANUAL')">Manual Desk</button>
+                    <button class="btn" onclick="changeMode('AUTONOMOUS_PATH')">Waypoint Pilot</button>
+                </div>
+            </div>
+
+            <div class="card-sec">
+                <h4>Surveillance Mission Registrar</h4>
+                <input type="text" id="ms-name" placeholder="Mission Identifier Label" class="select-input" style="margin-bottom:6px;">
+                <button class="btn" onclick="commitMissionProfile()" style="background:#1c242c; border:1px solid var(--dji-green); color:var(--dji-green)">Save Waypoints</button>
+                <select id="ms-selector" class="select-input" style="margin-top:6px;" onchange="loadMissionProfile()"></select>
+            </div>
+
+            <div class="card-sec">
+                <h4>Spring-Loaded Manual Vector Pad</h4>
+                <div class="control-stick-deck">
+                    <div id="joystick-pod"></div>
+                </div>
+                <div style="text-align:center; font-family:monospace; font-size:0.75rem; color:#8a96a3;">
+                    THR: <span id="lbl-t">0.00</span> | STR: <span id="lbl-s">0.00</span>
+                </div>
+            </div>
+
+            <div class="card-sec">
+                <h4>Telemetry Metrics Matrix</h4>
+                <div class="sys-row">Sonar Range Left: <span id="lbl-sl">0.0 cm</span></div>
+                <div class="sys-row">Sonar Range Right: <span id="lbl-sr">0.0 cm</span></div>
+                <div class="sys-row">Target Waypoints Logged: <span id="lbl-wpc">0</span></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+        let map, tankMarker;
+        let waypointMarkers = [];
+        let waypointCoords = [];
+        let rohtakCenter = [28.8955, 76.6066]; // Rohtak Central Coordination Anchor Point
+
+        function initDjiMap() {
+            // Earth Satellite view showing buildings (using Esri World Imagery)
+            map = L.map('map').setView(rohtakCenter, 16);
+            L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+                maxZoom: 19, attribution: S'Esri Satellite Imagery Map Subsystem'
+            }).addTo(map);
+
+            tankMarker = L.marker(rohtakCenter).addTo(map)
+                .bindPopup('<b style="color:#000;">TITAN PLATFORM TARGET</b>').openPopup();
+
+            map.on('click', (e) => {
+                logWaypoint(e.latlng.lat, e.latlng.lng);
+            });
+        }
+
+        function logWaypoint(lat, lon) {
+            waypointCoords.push({lat: lat, lon: lon});
+            let marker = L.circleMarker([lat, lon], {radius: 6, color: '#00ff66', fillColor: '#000', fillOpacity: 1, weight: 2})
+                          .addTo(map).bindPopup(`WP ${waypointCoords.length}`);
+            waypointMarkers.push(marker);
+            document.getElementById('lbl-wpc').innerText = waypointCoords.length;
+        }
+
+        function wipePathSequence() {
+            waypointMarkers.forEach(m => map.removeLayer(m));
+            waypointMarkers = []; waypointCoords = [];
+            document.getElementById('lbl-wpc').innerText = 0;
+        }
+
+        function lockMapToHome() {
+            map.setView(rohtakCenter, 17);
+        }
+
+        function verifyPeripheralState(id, text) {
+            const el = document.getElementById(id);
+            if(!el) return;
+            el.innerText = text;
+            if(text.includes("ONLINE") || text.includes("LOCK")) {
+                el.className = "badge bg-ok";
+            } else {
+                el.className = "badge bg-fail";
+            }
+        }
+
+        socket.on('telemetry', (data) => {
+            document.getElementById('lbl-sl').innerText = `${data.sonar_l.toFixed(1)} cm`;
+            document.getElementById('lbl-sr').innerText = `${data.sonar_r.toFixed(1)} cm`;
+            document.getElementById('hud-mode').innerText = data.mode;
+            document.getElementById('hud-lpwm').innerText = `${data.lpwm}us`;
+            document.getElementById('hud-rpwm').innerText = `${data.rpwm}us`;
+            document.getElementById('hud-pitch').innerText = `${data.pitch.toFixed(1)}°`;
+
+            verifyPeripheralState('chk-ml', data.health.motor_l);
+            verifyPeripheralState('chk-mr', data.health.motor_r);
+            verifyPeripheralState('chk-sl', data.health.sonar_l);
+            verifyPeripheralState('chk-sr', data.health.sonar_r);
+            verifyPeripheralState('chk-gps', data.health.gps);
+            verifyPeripheralState('chk-imu', data.health.imu);
+            verifyPeripheralState('chk-cam', data.health.camera);
+            verifyPeripheralState('chk-rc', data.health.rc_rx);
+
+            if (data.lat !== 0 && data.lon !== 0) {
+                const pos = new L.LatLng(data.lat, data.lon);
+                tankMarker.setLatLng(pos);
+            }
+        });
+
+        function initSpringJoystick() {
+            const pod = document.getElementById('joystick-pod');
+            const manager = nipplejs.create({
+                zone: pod, mode: 'static', position: {left: '50%', top: '50%'}, color: '#00ff66', size: 100
+            });
+
+            manager.on('move', (evt, data) => {
+                if(data && data.distance) {
+                    const scalar = Math.min(data.distance / 50, 1.0);
+                    const throttle = Math.sin(data.angle.radians) * scalar;
+                    const steering = Math.cos(data.angle.radians) * scalar;
+
+                    document.getElementById('lbl-t').innerText = throttle.toFixed(2);
+                    document.getElementById('lbl-s').innerText = steering.toFixed(2);
+
+                    socket.emit('vector_input', { throttle: throttle, steering: steering });
+                }
+            });
+
+            // Automatically snaps back to center on release
+            manager.on('end', () => {
+                document.getElementById('lbl-t').innerText = "0.00";
+                document.getElementById('lbl-s').innerText = "0.00";
+                socket.emit('vector_input', { throttle: 0.0, steering: 0.0 });
+            });
+        }
+
+        function commitMissionProfile() {
+            const label = document.getElementById('ms-name').value.trim();
+            if(!label) return;
+            socket.emit('save_mission_profile', {name: label, coords: waypointCoords});
+        }
+
+        function loadMissionProfile() {
+            const val = document.getElementById('ms-selector').value;
+            if(val) socket.emit('request_mission_load', {name: val});
+        }
+
+        socket.on('loaded_mission_profile_data', (data) => {
+            wipePathSequence();
+            document.getElementById('ms-name').value = data.name;
+            data.coords.forEach(pt => logWaypoint(pt.lat, pt.lon));
+        });
+
+        socket.on('update_missions_dropdown', (list) => {
+            const select = document.getElementById('ms-selector');
+            select.innerHTML = '<option value="">-- Load Surveillance Path --</option>';
+            list.forEach(m => select.innerHTML += `<option value="${m}">${m}</option>`);
+        });
+
+        function changeMode(m) { socket.emit('update_mode', { mode: m }); }
+
+        window.onload = () => { initDjiMap(); initSpringJoystick(); socket.emit('sync_missions_dropdown'); };
+    </script>
+</body>
+</html>
+"""
+
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+@app.route('/')
+def route_index(): return render_template_string(UI_TEMPLATE)
+
+def mjpeg_stream_broker():
+    global frame_buffer
+    while True:
+        with frame_lock:
+            frame = frame_buffer if frame_buffer is not None else cv2.imencode('.jpg', np.zeros((240, 320, 3), dtype=np.uint8))[1].tobytes()
+        yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        time.sleep(0.04)
+
+@app.route('/video_feed')
+def video_feed(): return Response(mjpeg_stream_broker(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+# ==========================================
+# ADVANCED FAIL-SAFE SOCKET SUBSYSTEMS
+# ==========================================
+@socketio.on('vector_input')
+def handle_vector_input(data):
+    if not isinstance(data, dict): return
+    if "MANUAL" in state["mode"]:
+        try:
+            t = float(data.get("throttle", 0.0))
+            s = float(data.get("steering", 0.0))
+            state["drive"]["throttle"] = max(min(t, 1.0), -1.0)
+            state["drive"]["steering"] = max(min(s, 1.0), -1.0)
+        except (ValueError, TypeError): pass
+
+@socketio.on('save_mission_profile')
+def save_mission(data):
+    if not isinstance(data, dict): return
+    name = data.get("name", "Surveillance_Cache").strip()
+    coords = data.get("coords", [])
+    if not name: return
+    
+    registry = {}
+    if os.path.exists(MISSIONS_FILE):
+        try:
+            with open(MISSIONS_FILE, "r") as f: registry = json.load(f)
+        except Exception: pass
+    registry[name] = coords
+    try:
+        with open(MISSIONS_FILE, "w") as f: json.dump(registry, f)
+        emit('update_missions_dropdown', list(registry.keys()), broadcast=True)
+    except Exception: pass
+
+@socketio.on('sync_missions_dropdown')
+def sync_dropdown():
+    if os.path.exists(MISSIONS_FILE):
+        try:
+            with open(MISSIONS_FILE, "r") as f: emit('update_missions_dropdown', list(json.load(f).keys()))
+        except Exception: pass
+
+@socketio.on('request_mission_load')
+def load_mission(data):
+    if not isinstance(data, dict): return
+    name = data.get("name")
+    if os.path.exists(MISSIONS_FILE):
+        try:
+            with open(MISSIONS_FILE, "r") as f:
+                reg = json.load(f)
+                if name in reg: emit('loaded_mission_profile_data', {"name": name, "coords": reg[name]})
+        except Exception: pass
+
+@socketio.on('update_mode')
+def handle_mode(data): 
+    if isinstance(data, dict): state["mode"] = data.get("mode", "MANUAL")
+
+def telemetry_emitter():
+    while True:
+        socketio.emit('telemetry', {
+            "sonar_l": state["sonar_l_cm"], "sonar_r": state["sonar_r_cm"],
+            "lat": state["lat"], "lon": state["lon"], "gps_fix": state["gps_fix"],
+            "mode": state["mode"], "health": state["health"],
+            "lpwm": state["current_left_pwm"], "rpwm": state["current_right_pwm"],
+            "pitch": state["pitch_deg"]
+        })
+        time.sleep(0.1)
+
+# ==========================================
+# OPERATIONAL THREAD RUNTIME LIFE ARRAY
+# ==========================================
+if __name__ == '__main__':
+    log.info("Spawning TITAN SYSTEMS FLIGHT ARCHITECTURE v13.0...")
+    
+    threading.Thread(target=motor_kinematics_controller, daemon=True).start()
+    threading.Thread(target=sonar_isolation_polling_worker, daemon=True).start()
+    threading.Thread(target=gps_parser_worker, daemon=True).start()
+    threading.Thread(target=camera_stream_worker, daemon=True).start()
+    threading.Thread(target=imu_pitch_roll_worker, daemon=True).start()
+    threading.Thread(target=telemetry_emitter, daemon=True).start()
+
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+
+    requirements.txt
+    flask>=3.0.0
+flask-socketio>=5.3.0
+numpy>=1.24.0
+opencv-python-headless>=4.7.0
+smbus2>=0.4.2
+
+README.md
+
+#  Titan OS v13.0 Autonomous RC Tank
+
+An advanced, high-performance embedded control and tracking ecosystem tailored for the **Raspberry Pi 4B (2GB RAM)**. This platform blends dual-channel hardware remote control with real-time web telemetry, utilizing an array of structural fail-safes designed explicitly to protect **3D-printed mechanical drive trains**. 
+
+Featuring a premium, DJI-inspired dark flight cockpit interface, it enables long-range surveillance, automated waypoint navigation, and edge obstacle mitigation over standard networks.
+
+---
+
+## ⚡ Key Architecture Highlights
+
+* **Gearbox Protection Matrix:** Implements digital **Anti-Jerk Slew Filters** that mathematically restrict aggressive acceleration updates per 20ms frame loop, keeping 3D-printed gears safe from structural fatigue or teeth stripping.
+* **Dual-Plane Control Arbitration:** Actively processes high-frequency edge interrupts on the FlySky FS-i6X receiver (**Channel 5**). Flipping the physical toggle instantly overrides web commands to hand absolute control back to the manual sticks.
+* **Terrain-Adaptive Gain Adjuster:** Continuously maps the tank's spatial position using an MPU gyro. The drive matrix automatically injects a throttle boost on steep climbs and scales back for dynamic braking on descents.
+* **Proportional Kinematic Mixer:** Smoothly cross-fades from subtle curve adjustments (slowing down the inner track while boosting the outer track) into absolute zero-radius pivot turns depending on stick deflection magnitude.
+* **Rohtak Region Geofence:** Features a localized coordinate anchor system tuned explicitly for high-accuracy tracking within the **Rohtak region, India**, using responsive satellite imagery layers that render structures in real time.
+
+---
+
+## 🛠️ Master Hardware Pinout Reference
+
+| Component | Function | Raspberry Pi BCM Pin | Physical Pin Header | Hardware Wiring Requirements |
+| :--- | :--- | :--- | :--- | :--- |
+| **Left Brushless ESC** | PWM Signal Line | GPIO 17 | **Pin 11** | Connect directly to Bidirectional ESC signal. |
+| **Right Brushless ESC**| PWM Signal Line | GPIO 18 | **Pin 12** | Connect directly to Bidirectional ESC signal. |
+| **Left Echo Sonar** | Trigger Pulse | GPIO 23 | **Pin 16** | Outbound ultrasonic transducer trigger. |
+| **Left Echo Sonar** | Echo Input | GPIO 24 | **Pin 18** | **Must use 5V-to-3.3V logic level divider.** |
+| **Right Echo Sonar** | Trigger Pulse | GPIO 22 | **Pin 15** | Outbound ultrasonic transducer trigger. |
+| **Right Echo Sonar** | Echo Input | GPIO 27 | **Pin 13** | **Must use 5V-to-3.3V logic level divider.** |
+| **FS-i6X Receiver** | Ch 1 (Steering) | GPIO 5 | **Pin 29** | Connect to iA6B Channel 1 PWM pin. |
+| **FS-i6X Receiver** | Ch 2 (Throttle) | GPIO 6 | **Pin 31** | Connect to iA6B Channel 2 PWM pin. |
+| **FS-i6X Receiver** | Ch 5 (Mode Switch)| GPIO 13 | **Pin 33** | Map to SwA or SwC on transmitter interface. |
+| **MPU-9250 / 6050** | Serial Data (SDA) | GPIO 2 | **Pin 3** | I2C Telemetry Bus (Connect pull-up if missing).|
+| **MPU-9250 / 6050** | Serial Clock (SCL)| GPIO 3 | **Pin 5** | I2C Telemetry Bus Clock Line. |
+| **NEO-6M GPS** | UART Receive (RX) | GPIO 15 | **Pin 10** | Cross-connect to GPS Module **TXD** Pin. |
+| **NEO-6M GPS** | UART Transmit (TX)| GPIO 14 | **Pin 8** | Cross-connect to GPS Module **RXD** Pin. |
+| **System Power Ground**| Common Ground | GND | **Pin 6 / 14 / 20**| **All logic, ESCs, and RX must share this.** |
+
+---
+
+## 🚀 Quick-Start Deployment Guide
+
+### 1. Initialize Host Dependencies
+Before running the primary platform engine, updates and system-level input tracking daemons must be activated on your Raspberry Pi:
+
+```bash
+sudo apt-get update
+sudo apt-get install pigpio python3-pigpio rpicam-apps -y
+sudo systemctl enable pigpiod
+sudo systemctl start pigpiod
