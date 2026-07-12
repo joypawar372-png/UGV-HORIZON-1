@@ -49,11 +49,11 @@ sudo systemctl enable pigpiod
 sudo systemctl start pigpiod
 
 2. Environment Setup
-Install the required micro-framework libraries via pip:
+Install the required micro-framework libraries via pip:```bash
 pip install flask flask-socketio numpy opencv-python-headless smbus2 pyserial
 
 3. Execution
-Run the core runtime script as a superuser to allow the software to open the hardware DMA memory channels for high-accuracy PWM execution:
+Run the core runtime script as a superuser to allow the software to open the hardware DMA memory channels for high-accuracy PWM execution:```bash
 sudo python3 main.py
 
 🕹️ Cockpit System Control Modes
