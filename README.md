@@ -17,6 +17,7 @@ Featuring a premium, dark flight cockpit interface, it enables long-range survei
 <img width="477" height="615" alt="image" src="https://github.com/user-attachments/assets/022b3c67-f676-4dcc-a4ad-732d1d669fc2" />
 <img width="490" height="722" alt="Screenshot 2026-07-13 090218" src="https://github.com/user-attachments/assets/ab2f758a-fede-42a8-8d11-39daad3be4d8" />
 <img width="486" height="695" alt="Screenshot 2026-07-13 090307" src="https://github.com/user-attachments/assets/24df1cdf-8d65-4ac4-87a9-fa6cc2fd8239" />
+<img width="466" height="469" alt="Screenshot 2026-07-13 090316" src="https://github.com/user-attachments/assets/b7240ba0-703a-4758-bb7a-53287b660ec2" />
 ---
 
 
@@ -74,8 +75,6 @@ sudo apt-get install pigpio python3-pigpio rpicam-apps -y
 sudo systemctl enable pigpiod
 sudo systemctl start pigpiod
 
-
-<img width="466" height="469" alt="Screenshot 2026-07-13 090316" src="https://github.com/user-attachments/assets/b7240ba0-703a-4758-bb7a-53287b660ec2" />
 
 
 
