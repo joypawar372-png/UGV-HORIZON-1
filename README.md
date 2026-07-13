@@ -14,16 +14,19 @@ Featuring a premium, dark flight cockpit interface, it enables long-range survei
 * **Proportional Kinematic Mixer:** Smoothly cross-fades from subtle curve adjustments (slowing down the inner track while boosting the outer track) into absolute zero-radius pivot turns depending on stick deflection magnitude.
 * **Rohtak Region Geofence:** Features a localized coordinate anchor system tuned explicitly for high-accuracy tracking within the **Rohtak region, India**, using responsive satellite imagery layers that render structures in real time.
 
+<img width="477" height="615" alt="image" src="https://github.com/user-attachments/assets/022b3c67-f676-4dcc-a4ad-732d1d669fc2" />
+<img width="490" height="722" alt="Screenshot 2026-07-13 090218" src="https://github.com/user-attachments/assets/ab2f758a-fede-42a8-8d11-39daad3be4d8" />
+<img width="486" height="695" alt="Screenshot 2026-07-13 090307" src="https://github.com/user-attachments/assets/24df1cdf-8d65-4ac4-87a9-fa6cc2fd8239" />
 ---
 
 
 ---
-# 🛰️ UGV HORIZON 1 - COMPLETE DEPLOYMENT PLAYBOOK
+🛰️ UGV HORIZON 1 - COMPLETE DEPLOYMENT PLAYBOOK
 
 This master deployment guide covers setting up your project files on your main computer, pushing them to GitHub, and pulling/running them directly on your Raspberry Pi 4B.
 
 
-## 📁 1. ENVIRONMENT CONFIGURATION FILES
+ 📁 1. ENVIRONMENT CONFIGURATION FILES
 
 ### File: requirements.txt
 # Paste the following block directly into a file named "requirements.txt"
@@ -35,15 +38,12 @@ smbus2>=0.4.2
 pyserial>=3.5
 
 ---
+UGV HORIZON 1 (Autonomous RC Tank Edition)
 
-### File: README.md
-# Paste the following block directly into a file named "README.md"
-# 🛰️ UGV HORIZON 1 (Autonomous RC Tank Edition)
-
-🤖 Use Case: Autonomous long-range tactical surveillance rover. 💰 Build Cost: ~$220. ⚙️ Features: DJI-inspired HUD web dashboard, FlySky FS-i6X manual override, 3D-printed gear torque protection, terrain-adaptive IMU throttle, dual-sonar obstacle avoidance, NEO-6M GPS waypoint navigation, and live Pi camera video streaming.
+ Use Case: Autonomous long-range tactical surveillance rover. 💰 Build Cost: ~$220. ⚙️ Features: DJI-inspired HUD web dashboard, FlySky FS-i6X manual override, 3D-printed gear torque protection, terrain-adaptive IMU throttle, dual-sonar obstacle avoidance, NEO-6M GPS waypoint navigation, and live Pi camera video streaming.
 
 
-## 🛠️ Master Hardware Pinout Reference
+## Master Hardware Pinout Reference
 
 | Component | Function | Raspberry Pi BCM Pin | Physical Pin Header | Hardware Wiring Requirements |
 | :--- | :--- | :--- | :--- | :--- |
@@ -75,9 +75,6 @@ sudo systemctl enable pigpiod
 sudo systemctl start pigpiod
 
 
-<img width="477" height="615" alt="image" src="https://github.com/user-attachments/assets/022b3c67-f676-4dcc-a4ad-732d1d669fc2" />
-<img width="490" height="722" alt="Screenshot 2026-07-13 090218" src="https://github.com/user-attachments/assets/ab2f758a-fede-42a8-8d11-39daad3be4d8" />
-<img width="486" height="695" alt="Screenshot 2026-07-13 090307" src="https://github.com/user-attachments/assets/24df1cdf-8d65-4ac4-87a9-fa6cc2fd8239" />
 <img width="466" height="469" alt="Screenshot 2026-07-13 090316" src="https://github.com/user-attachments/assets/b7240ba0-703a-4758-bb7a-53287b660ec2" />
 
 
